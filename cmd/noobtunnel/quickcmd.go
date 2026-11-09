@@ -206,6 +206,7 @@ func runQuick(args []string) (resultErr error) {
 		confirmed := promptQuickOrphanRemoval()
 		deadline = time.Now().Add(remaining)
 		ctx, cancel = context.WithDeadline(context.Background(), deadline)
+		defer cancel()
 		client.ctx = ctx
 		if !confirmed {
 			return errors.New("existing agent preserved; Quick setup cancelled")

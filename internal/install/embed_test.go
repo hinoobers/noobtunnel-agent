@@ -25,6 +25,8 @@ func TestScriptIsPosixShell(t *testing.T) {
 		"noobtunnel_linux_", "manifest.json", "sha256sum",
 		"systemctl", "nohup",
 		"NOOBTUNNEL_SERVER", "NOOBTUNNEL_TOKEN", "NOOBTUNNEL_FINGERPRINT",
+		"/etc/hosts.noobtunnel-journal:/run/noobtunnel/host-hosts.noobtunnel-journal",
+		"ensure_hosts_journal",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("installer is missing %q", want)

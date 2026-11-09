@@ -460,6 +460,10 @@ update_container() {
 	if ! grep -q '/etc/hosts:/run/noobtunnel/host-hosts' "${DIR}/docker-compose.yml"; then
 		sed -i '/^      - \/lib\/modules:\/lib\/modules:ro$/a\      - /etc/hosts:/run/noobtunnel/host-hosts' "${DIR}/docker-compose.yml"
 	fi
+	ensure_hosts_journal
+	if ! grep -q '/etc/hosts.noobtunnel-journal:/run/noobtunnel/host-hosts.noobtunnel-journal' "${DIR}/docker-compose.yml"; then
+		sed -i '/^      - \/etc\/hosts:\/run\/noobtunnel\/host-hosts$/a\      - /etc/hosts.noobtunnel-journal:/run/noobtunnel/host-hosts.noobtunnel-journal' "${DIR}/docker-compose.yml"
+	fi
 	compose_run up -d --build ||
 		die "docker compose could not restart the container" "read the output above, then run: docker compose up -d --build"
 	sleep 3
@@ -539,15 +543,23 @@ install_packages() {
 	fi
 }
 
-# docker_install writes the agent's Docker files into the current directory and
-# starts the container from there. The container shares the host's network
-# namespace, because the WireGuard interface and its routes have to belong to this
-# machine, and --advertise-all has to see this machine's own networks.
+ensure_hosts_journal() {
+	[ ! -L /etc/hosts.noobtunnel-journal ] || die "hosts recovery journal must not be a symbolic link"
+	if [ ! -e /etc/hosts.noobtunnel-journal ]; then
+		(umask 077; set -C; : > /etc/hosts.noobtunnel-journal) || die "could not create hosts recovery journal"
+	fi
+	[ -f /etc/hosts.noobtunnel-journal ] || die "hosts recovery journal is not a regular file"
+	chown 0:0 /etc/hosts.noobtunnel-journal || die "could not secure hosts recovery journal ownership"
+	chmod 0600 /etc/hosts.noobtunnel-journal || die "could not secure hosts recovery journal"
+}
+
+# The agent shares the host network and hosts-file recovery journal.
 docker_install() {
 	DIR="$PWD"
 	log "installing the agent as a Docker container in ${DIR}"
 	[ -w "$DIR" ] || die "${DIR} is not writable" "run this from a directory you can write to, for example: mkdir -p /opt/noobtunnel-agent && cd /opt/noobtunnel-agent"
 	ensure_docker
+	ensure_hosts_journal
 
 	log "downloading the agent binary for linux/${ARCH}"
 	# shellcheck disable=SC2086
@@ -613,6 +625,7 @@ services:
       - ./noobtunnel-state:/var/lib/noobtunnel
       - /lib/modules:/lib/modules:ro
       - /etc/hosts:/run/noobtunnel/host-hosts
+      - /etc/hosts.noobtunnel-journal:/run/noobtunnel/host-hosts.noobtunnel-journal
     env_file:
       - .env
 COMPOSE

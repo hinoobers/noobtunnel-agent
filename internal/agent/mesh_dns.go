@@ -67,7 +67,52 @@ func (a *Agent) clearMeshDNS() {
 func writeMeshDNSHosts(path string, agentID uint32, records []meshDNSRecord) error {
 	meshDNSHostsMu.Lock()
 	defer meshDNSHostsMu.Unlock()
-	old, err := os.ReadFile(path)
+	path, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("hosts path must be a regular file")
+	}
+	unlock, err := lockHostsFile(file)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	journalPath := path + ".noobtunnel-journal"
+	journalInfo, statErr := os.Lstat(journalPath)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return statErr
+	}
+	if statErr == nil && !journalInfo.Mode().IsRegular() {
+		return fmt.Errorf("hosts journal must be a regular file")
+	}
+	journal, err := os.OpenFile(journalPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer journal.Close()
+	if os.IsNotExist(statErr) {
+		if err := journal.Sync(); err != nil {
+			return err
+		}
+		if err := syncHostsJournalDirectory(filepath.Dir(path)); err != nil {
+			return err
+		}
+	}
+	if err := recoverHostsUpdate(file, journal); err != nil {
+		return err
+	}
+	old, err := readHostsData(file, maxHostsBytes)
 	if err != nil {
 		return err
 	}
@@ -75,7 +120,7 @@ func writeMeshDNSHosts(path string, agentID uint32, records []meshDNSRecord) err
 	if next == string(old) {
 		return nil
 	}
-	return os.WriteFile(path, []byte(next), 0644)
+	return commitHostsUpdate(file, journal, old, []byte(next))
 }
 
 func meshDNSHostsContent(old string, agentID uint32, records []meshDNSRecord) string {

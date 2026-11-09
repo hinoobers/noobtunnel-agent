@@ -20,6 +20,10 @@ const forwardTimeout = 5 * time.Second
 // udpForwardIdleTimeout forgets a UDP client's return path once it has been
 // quiet. A fresh datagram recreates it immediately.
 const udpForwardIdleTimeout = 60 * time.Second
+const maxUDPForwardSessions = 256
+const maxAgentUDPForwardSessions = 2048
+
+var udpForwardSlots = make(chan struct{}, maxAgentUDPForwardSessions)
 
 type forwardKey struct {
 	network string
@@ -172,6 +176,10 @@ func resolveForwardTarget(target string) (string, error) {
 // control node already uses one source socket per public UDP client, so this
 // second mapping preserves replies and concurrent game sessions end to end.
 func (f *forwarder) servePackets(ctx context.Context, pc net.PacketConn) {
+	f.servePacketsWithLimit(ctx, pc, maxUDPForwardSessions)
+}
+
+func (f *forwarder) servePacketsWithLimit(ctx context.Context, pc net.PacketConn, limit int) {
 	type session struct {
 		client net.Addr
 		conn   net.Conn
@@ -236,8 +244,19 @@ func (f *forwarder) servePackets(ctx context.Context, pc net.PacketConn) {
 		sessionsMu.Lock()
 		s := sessions[key]
 		if s == nil {
+			if len(sessions) >= limit {
+				sessionsMu.Unlock()
+				continue
+			}
+			select {
+			case udpForwardSlots <- struct{}{}:
+			default:
+				sessionsMu.Unlock()
+				continue
+			}
 			conn, err := net.DialTimeout("udp", f.resolvedTarget, forwardTimeout)
 			if err != nil {
+				<-udpForwardSlots
 				sessionsMu.Unlock()
 				f.agent.log.Debug("forwarded UDP service is not reachable", "target", f.resolvedTarget, "error", err)
 				continue
@@ -245,6 +264,7 @@ func (f *forwarder) servePackets(ctx context.Context, pc net.PacketConn) {
 			s = &session{client: client, conn: conn, last: time.Now()}
 			sessions[key] = s
 			go func(key string, s *session) {
+				defer func() { <-udpForwardSlots }()
 				reply := make([]byte, 64*1024)
 				for {
 					n, err := s.conn.Read(reply)
