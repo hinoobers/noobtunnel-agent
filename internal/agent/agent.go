@@ -45,7 +45,10 @@ type Options struct {
 	// WGListenPort is the stable UDP port for this agent. Zero derives one from
 	// the enrolled agent ID, avoiding a new NAT/ECMP path after every restart.
 	WGListenPort int
-	StateDir     string
+	// UDP forwarding limits count source IP:port mappings, not players.
+	UDPMaxSessions      int
+	UDPMaxTotalSessions int
+	StateDir            string
 	// Name overrides the hostname reported to the control node.
 	Name string
 	// Advertise lists extra CIDRs this agent routes for the mesh.
@@ -102,6 +105,8 @@ type Agent struct {
 	mu                 sync.Mutex
 	session            *sessionState
 	forwards           map[forwardKey]*forwarder
+	udpBudgetOnce      sync.Once
+	udpSlots           chan struct{}
 	// forwardErrors remembers why a forward is not running, so a retry that fails
 	// the same way does not repeat the warning.
 	forwardErrors map[forwardKey]string
@@ -142,6 +147,18 @@ type sessionState struct {
 
 // New creates an agent.
 func New(opts Options) (*Agent, error) {
+	if opts.UDPMaxSessions < 0 || opts.UDPMaxTotalSessions < 0 {
+		return nil, errors.New("agent: UDP session limits must be positive")
+	}
+	if opts.UDPMaxSessions == 0 {
+		opts.UDPMaxSessions = DefaultUDPMaxSessions
+	}
+	if opts.UDPMaxTotalSessions == 0 {
+		opts.UDPMaxTotalSessions = DefaultUDPMaxTotalSessions
+	}
+	if opts.UDPMaxSessions > opts.UDPMaxTotalSessions {
+		return nil, errors.New("agent: per-service UDP limit exceeds total UDP limit")
+	}
 	if opts.ControlEndpoint == "" {
 		return nil, errors.New("agent: control endpoint is required")
 	}

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hinoobers/noobtunnel-agent/internal/proto"
@@ -20,10 +21,8 @@ const forwardTimeout = 5 * time.Second
 // udpForwardIdleTimeout forgets a UDP client's return path once it has been
 // quiet. A fresh datagram recreates it immediately.
 const udpForwardIdleTimeout = 60 * time.Second
-const maxUDPForwardSessions = 256
-const maxAgentUDPForwardSessions = 2048
-
-var udpForwardSlots = make(chan struct{}, maxAgentUDPForwardSessions)
+const DefaultUDPMaxSessions = 4096
+const DefaultUDPMaxTotalSessions = 8192
 
 type forwardKey struct {
 	network string
@@ -38,10 +37,11 @@ type forwarder struct {
 	port           int
 	network        string
 
-	mu   sync.Mutex
-	ln   net.Listener
-	pc   net.PacketConn
-	done chan struct{}
+	mu           sync.Mutex
+	ln           net.Listener
+	pc           net.PacketConn
+	done         chan struct{}
+	udpWarningAt atomic.Int64
 }
 
 // syncForwards starts the forwards that should be running and stops the rest.
@@ -176,10 +176,34 @@ func resolveForwardTarget(target string) (string, error) {
 // control node already uses one source socket per public UDP client, so this
 // second mapping preserves replies and concurrent game sessions end to end.
 func (f *forwarder) servePackets(ctx context.Context, pc net.PacketConn) {
-	f.servePacketsWithLimit(ctx, pc, maxUDPForwardSessions)
+	limit := f.agent.opts.UDPMaxSessions
+	if limit == 0 {
+		limit = DefaultUDPMaxSessions
+	}
+	f.servePacketsWithLimit(ctx, pc, limit)
+}
+
+func (a *Agent) udpSessionSlots() chan struct{} {
+	a.udpBudgetOnce.Do(func() {
+		limit := a.opts.UDPMaxTotalSessions
+		if limit == 0 {
+			limit = DefaultUDPMaxTotalSessions
+		}
+		a.udpSlots = make(chan struct{}, limit)
+	})
+	return a.udpSlots
+}
+
+func (f *forwarder) warnUDPLimit(reason string, limit int) {
+	now := time.Now().Unix()
+	last := f.udpWarningAt.Load()
+	if now-last >= 30 && f.udpWarningAt.CompareAndSwap(last, now) {
+		f.agent.log.Warn("new UDP session dropped at capacity", "port", f.port, "scope", reason, "limit", limit)
+	}
 }
 
 func (f *forwarder) servePacketsWithLimit(ctx context.Context, pc net.PacketConn, limit int) {
+	slots := f.agent.udpSessionSlots()
 	type session struct {
 		client net.Addr
 		conn   net.Conn
@@ -246,17 +270,19 @@ func (f *forwarder) servePacketsWithLimit(ctx context.Context, pc net.PacketConn
 		if s == nil {
 			if len(sessions) >= limit {
 				sessionsMu.Unlock()
+				f.warnUDPLimit("per-service", limit)
 				continue
 			}
 			select {
-			case udpForwardSlots <- struct{}{}:
+			case slots <- struct{}{}:
 			default:
 				sessionsMu.Unlock()
+				f.warnUDPLimit("agent total", cap(slots))
 				continue
 			}
 			conn, err := net.DialTimeout("udp", f.resolvedTarget, forwardTimeout)
 			if err != nil {
-				<-udpForwardSlots
+				<-slots
 				sessionsMu.Unlock()
 				f.agent.log.Debug("forwarded UDP service is not reachable", "target", f.resolvedTarget, "error", err)
 				continue
@@ -264,24 +290,40 @@ func (f *forwarder) servePacketsWithLimit(ctx context.Context, pc net.PacketConn
 			s = &session{client: client, conn: conn, last: time.Now()}
 			sessions[key] = s
 			go func(key string, s *session) {
-				defer func() { <-udpForwardSlots }()
-				reply := make([]byte, 64*1024)
+				defer func() {
+					sessionsMu.Lock()
+					if sessions[key] == s {
+						delete(sessions, key)
+					}
+					sessionsMu.Unlock()
+					_ = s.conn.Close()
+					<-slots
+				}()
+				udp := s.conn.(*net.UDPConn)
+				raw, err := udp.SyscallConn()
+				if err != nil {
+					return
+				}
 				for {
-					n, err := s.conn.Read(reply)
+					if err := waitUDPReadable(raw); err != nil {
+						break
+					}
+					reply, err := borrowUDPReplyBuffer(ctx, done)
 					if err != nil {
 						break
 					}
-					if _, err := pc.WriteTo(reply[:n], s.client); err != nil {
+					n, err := s.conn.Read(reply)
+					if err != nil {
+						returnUDPReplyBuffer(reply)
+						break
+					}
+					_, err = pc.WriteTo(reply[:n], s.client)
+					returnUDPReplyBuffer(reply)
+					if err != nil {
 						break
 					}
 					touch(s)
 				}
-				sessionsMu.Lock()
-				if sessions[key] == s {
-					delete(sessions, key)
-				}
-				sessionsMu.Unlock()
-				_ = s.conn.Close()
 			}(key, s)
 		}
 		sessionsMu.Unlock()

@@ -22,6 +22,8 @@ func runAgent(args []string) error {
 		insecure     = fs.Bool("insecure", envBool("NOOBTUNNEL_INSECURE", false), "skip certificate verification (testing only)")
 		iface        = fs.String("interface", env("NOOBTUNNEL_INTERFACE", "noobtun"), "WireGuard interface name")
 		wgPort       = fs.Int("wg-port", envInt("NOOBTUNNEL_WG_PORT", 0), "stable WireGuard UDP port (zero derives it from the agent ID)")
+		udpMax       = fs.Int("udp-max-sessions", envInt("NOOBTUNNEL_UDP_MAX_SESSIONS", agent.DefaultUDPMaxSessions), "maximum UDP source mappings per forwarded service")
+		udpTotal     = fs.Int("udp-max-total-sessions", envInt("NOOBTUNNEL_UDP_MAX_TOTAL_SESSIONS", agent.DefaultUDPMaxTotalSessions), "maximum UDP source mappings across this agent")
 		stateDir     = fs.String("state-dir", env("NOOBTUNNEL_STATE_DIR", defaultStateDir()), "directory for the agent identity")
 		name         = fs.String("name", env("NOOBTUNNEL_NAME", ""), "name reported to the control node (defaults to the hostname)")
 		advertise    = fs.String("advertise", env("NOOBTUNNEL_ADVERTISE", ""), "comma separated CIDRs this agent routes for the mesh")
@@ -34,6 +36,9 @@ func runAgent(args []string) error {
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *udpMax <= 0 || *udpTotal <= 0 || *udpMax > *udpTotal {
+		return fmt.Errorf("UDP session limits must be positive and the per-service limit cannot exceed the total")
 	}
 	if *serverAddr == "" {
 		return fmt.Errorf("--server is required (for example --server 203.0.113.9:8443)")
@@ -54,21 +59,23 @@ func runAgent(args []string) error {
 		return err
 	}
 	instance, err := agent.New(agent.Options{
-		ControlEndpoint: strings.TrimSpace(*serverAddr),
-		Token:           strings.TrimSpace(*token),
-		Fingerprint:     strings.TrimSpace(*fingerprint),
-		Insecure:        *insecure,
-		Interface:       *iface,
-		WGListenPort:    *wgPort,
-		StateDir:        *stateDir,
-		Name:            *name,
-		Advertise:       parseCommaList([]string{*advertise}),
-		AdvertiseAll:    isTrue(*advertiseAll),
-		Direct:          isTrue(*direct),
-		KeepInterface:   isTrue(*keep),
-		SetupSystem:     *setupSystem,
-		Logger:          logger,
-		Backend:         backend,
+		ControlEndpoint:     strings.TrimSpace(*serverAddr),
+		Token:               strings.TrimSpace(*token),
+		Fingerprint:         strings.TrimSpace(*fingerprint),
+		Insecure:            *insecure,
+		Interface:           *iface,
+		WGListenPort:        *wgPort,
+		UDPMaxSessions:      *udpMax,
+		UDPMaxTotalSessions: *udpTotal,
+		StateDir:            *stateDir,
+		Name:                *name,
+		Advertise:           parseCommaList([]string{*advertise}),
+		AdvertiseAll:        isTrue(*advertiseAll),
+		Direct:              isTrue(*direct),
+		KeepInterface:       isTrue(*keep),
+		SetupSystem:         *setupSystem,
+		Logger:              logger,
+		Backend:             backend,
 	})
 	if err != nil {
 		return err
@@ -80,6 +87,7 @@ func runAgent(args []string) error {
 		"publicKey", instance.Identity().PublicKey,
 		"directPaths", isTrue(*direct),
 		"backend", backend.Name())
+	logger.Info("UDP forwarding limits", "perService", *udpMax, "total", *udpTotal)
 	if !isTrue(*direct) {
 		logger.Info("direct paths disabled, all mesh traffic will be relayed by the control node")
 	}
