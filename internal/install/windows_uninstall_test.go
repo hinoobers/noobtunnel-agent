@@ -19,7 +19,7 @@ func TestWindowsUninstallDiscovery(t *testing.T) {
 	if err != nil {
 		t.Skip("Windows PowerShell unavailable")
 	}
-	for _, mode := range []string{"legacy", "saved", "explicit", "wrong-certificate", "remote-failure", "local-only", "missing-id"} {
+	for _, mode := range []string{"legacy", "saved", "explicit", "legacy-removed", "saved-removed", "explicit-removed", "wrong-certificate", "remote-failure", "unauthorized", "local-only", "missing-id"} {
 		t.Run(mode, func(t *testing.T) {
 			var requests atomic.Int32
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,6 +31,12 @@ func TestWindowsUninstallDiscovery(t *testing.T) {
 				}
 				if mode == "remote-failure" {
 					w.WriteHeader(500)
+				}
+				if mode == "unauthorized" {
+					w.WriteHeader(401)
+				}
+				if strings.HasSuffix(mode, "-removed") {
+					fmt.Fprint(w, `{"ok":true,"alreadyRemoved":true}`)
 				}
 			}))
 			defer server.Close()
@@ -58,7 +64,7 @@ func TestWindowsUninstallDiscovery(t *testing.T) {
 			if mode != "missing-id" {
 				write("runtime.json", `{"agentId":42}`)
 			}
-			if mode == "saved" {
+			if strings.HasPrefix(mode, "saved") {
 				write("uninstall.json", fmt.Sprintf(`{"server":%q,"pin":%q}`, endpoint, base64.StdEncoding.EncodeToString(pin[:])))
 			}
 			// Only the elevation block is bypassed. All actual destructive operations
@@ -84,7 +90,7 @@ function Remove-NetFirewallRule { process {} }
 			if mode == "local-only" {
 				command += " -LocalOnly"
 			}
-			if mode == "explicit" {
+			if strings.HasPrefix(mode, "explicit") {
 				command = strings.Replace(command, endpoint+`" "--fingerprint"`, `wrong.invalid:1" "--fingerprint"`, 1)
 				command += " -Server " + quote(endpoint) + " -Pin " + quote(base64.StdEncoding.EncodeToString(pin[:])) + " -AgentId 42"
 			}
@@ -94,7 +100,7 @@ function Remove-NetFirewallRule { process {} }
 				t.Fatal(err)
 			}
 			out, runErr := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness).CombinedOutput()
-			fails := mode == "wrong-certificate" || mode == "remote-failure" || mode == "missing-id"
+			fails := mode == "wrong-certificate" || mode == "remote-failure" || mode == "unauthorized" || mode == "missing-id"
 			if (runErr != nil) != fails {
 				t.Fatalf("unexpected result: %v\n%s", runErr, out)
 			}

@@ -26,13 +26,7 @@ This removes the local agent but keeps its saved identity. Add `--purge` to remo
 On Windows, run in PowerShell:
 
 ```powershell
-$script = Join-Path $env:TEMP ("noobtunnel-uninstall-" + [guid]::NewGuid() + ".ps1")
-try {
-    Invoke-WebRequest https://tunnel.byenoob.com/install.ps1 -UseBasicParsing -OutFile $script -ErrorAction Stop
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script -Uninstall
-} finally {
-    Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
-}
+$s = Join-Path $env:TEMP ([guid]::NewGuid().ToString() + '.ps1'); try { iwr https://tunnel.byenoob.com/install.ps1 -UseBasicParsing -OutFile $s -ErrorAction Stop; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $s -Uninstall } finally { Remove-Item -LiteralPath $s -Force -ErrorAction SilentlyContinue }
 ```
 
-This finds the installed agent automatically and removes it from both the PC and the panel, along with its published resources and saved identity. Approve the administrator prompt. Run it on the PC where the agent is installed; any folder works. If the panel entry was already deleted, add `-LocalOnly` after `-Uninstall` to remove only the local installation.
+This finds the installed agent automatically and removes it from the PC and the panel, along with its published resources and saved identity. If the panel entry is already gone, it still removes the local installation.
