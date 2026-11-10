@@ -23,4 +23,16 @@ curl -fsSL https://tunnel.byenoob.com/install.sh | sudo sh -s -- --uninstall
 
 This removes the local agent but keeps its saved identity. Add `--purge` to remove that identity too. The agent's panel entry is removed separately.
 
-On Windows, use the agent's uninstall action in the [panel](https://tunnel.byenoob.com) to get its machine-specific uninstall command.
+On Windows, run in PowerShell:
+
+```powershell
+$script = Join-Path $env:TEMP ("noobtunnel-uninstall-" + [guid]::NewGuid() + ".ps1")
+try {
+    Invoke-WebRequest https://tunnel.byenoob.com/install.ps1 -UseBasicParsing -OutFile $script -ErrorAction Stop
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script -Uninstall
+} finally {
+    Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
+}
+```
+
+This finds the installed agent automatically and removes it from both the PC and the panel, along with its published resources and saved identity. Approve the administrator prompt. Run it on the PC where the agent is installed; any folder works. If the panel entry was already deleted, add `-LocalOnly` after `-Uninstall` to remove only the local installation.

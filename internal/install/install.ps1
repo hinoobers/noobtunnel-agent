@@ -25,7 +25,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
   function PSQuote([string]$Value) { return "'" + $Value.Replace("'", "''") + "'" }
   if ($Uninstall) {
     $reentry = '& ' + (PSQuote $PSCommandPath) + ' -Uninstall -Server ' + (PSQuote $Server) +
-      ' -Pin ' + (PSQuote $Pin) + ' -AgentId ' + $AgentId
+      ' -Pin ' + (PSQuote $Pin) + ' -Fingerprint ' + (PSQuote $Fingerprint) + ' -AgentId ' + $AgentId
     if ($LocalOnly) { $reentry += ' -LocalOnly' }
   } else {
     $reentry = '& ' + (PSQuote $PSCommandPath) + ' -Server ' + (PSQuote $Server) +
@@ -40,9 +40,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
   $process = Start-Process -FilePath powershell.exe -Verb RunAs -PassThru -Wait -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded)
   exit $process.ExitCode
 }
-if ($Server -notmatch '^[A-Za-z0-9.\-]+:\d+$') { throw 'Invalid control server address.' }
 [void](Get-RemainingSetupSeconds)
-if ($Pin -notmatch '^[A-Za-z0-9+/]{43}=$') { throw 'Invalid certificate pin.' }
 $root = Join-Path $env:ProgramFiles 'noobtunnel'
 $state = Join-Path $env:ProgramData 'noobtunnel'
 $binary = Join-Path $root 'noobtunnel.exe'
@@ -50,15 +48,85 @@ $dll = Join-Path $root 'wintun.dll'
 $tokenFile = Join-Path $state 'token'
 
 if ($Uninstall) {
-  if (-not $LocalOnly -and $AgentId -eq 0) { throw 'Invalid agent ID.' }
+  if (-not $LocalOnly) {
+    # New installs save the pin; older installs keep the endpoint and certificate
+    # fingerprint in the service command. Only fill in arguments that were omitted.
+    $saved = $null
+    $savedPath = Join-Path $state 'uninstall.json'
+    if (Test-Path -LiteralPath $savedPath) { $saved = Get-Content -LiteralPath $savedPath -Raw | ConvertFrom-Json }
+    $installed = Get-CimInstance Win32_Service -Filter "Name='noobtunnel-agent'" -ErrorAction SilentlyContinue
+    function Get-AgentArgument([string]$Key) {
+      if (-not $installed) { return '' }
+      $match = [regex]::Match($installed.PathName, '(?:^|\s)"?--' + [regex]::Escape($Key) + '"?(?:\s+|=)(?:"([^"]*)"|([^\s"]+))')
+      if ($match.Success) {
+        if ($match.Groups[1].Success) { return $match.Groups[1].Value }
+        return $match.Groups[2].Value
+      }
+      return ''
+    }
+    $installedServer = Get-AgentArgument 'server'
+    if (-not $Server) {
+      if ($installedServer) { $Server = $installedServer }
+      elseif ($saved) { $Server = $saved.server }
+    }
+    if (-not $Pin -and $saved -and $saved.server -eq $Server) { $Pin = $saved.pin }
+    if (-not $Fingerprint -and $installedServer -eq $Server) { $Fingerprint = Get-AgentArgument 'fingerprint' }
+    if (-not $AgentId) {
+      $runtimePath = Join-Path $state 'runtime.json'
+      if (Test-Path -LiteralPath $runtimePath) {
+        $runtime = Get-Content -LiteralPath $runtimePath -Raw | ConvertFrom-Json
+        $AgentId = $runtime.agentId
+      }
+    }
+    if ($AgentId -eq 0) { throw 'Cannot find the agent ID. Supply -AgentId from the panel or use -LocalOnly.' }
+  }
   if (-not (Test-Path -LiteralPath $tokenFile)) { throw 'No local agent token found. Use control node only removal.' }
   $localToken = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
   if (-not $localToken) { throw 'The local agent token is empty.' }
   if (-not $LocalOnly) {
-    ('header = "Authorization: Bearer ' + $localToken + '"') | & curl.exe --fail --silent --show-error `
-    --insecure --connect-timeout 5 --max-time (Get-RemainingSetupSeconds) --pinnedpubkey "sha256//$Pin" --config - --request POST `
-    "https://$Server/api/agent-uninstall/$AgentId" --output NUL
-    if ($LASTEXITCODE -ne 0) { throw 'Control node removal failed. The local agent was kept so you can retry.' }
+    if ($Server -notmatch '^[A-Za-z0-9.\-]+:\d+$') { throw 'Cannot find the control server. Supply -Server or use -LocalOnly.' }
+    if ($Pin) {
+      if ($Pin -notmatch '^[A-Za-z0-9+/]{43}=$') { throw 'Invalid certificate pin.' }
+      ('header = "Authorization: Bearer ' + $localToken + '"') | & curl.exe --fail --silent --show-error `
+      --insecure --connect-timeout 5 --max-time (Get-RemainingSetupSeconds) --pinnedpubkey "sha256//$Pin" --config - --request POST `
+      "https://$Server/api/agent-uninstall/$AgentId" --output NUL
+      if ($LASTEXITCODE -ne 0) { throw 'Control node removal failed. The local agent was kept so you can retry.' }
+    } else {
+      $expectedFingerprint = $Fingerprint.Replace(':', '')
+      if ($expectedFingerprint -notmatch '^[a-fA-F0-9]{64}$') { throw 'Cannot find the certificate pin or fingerprint. Supply -Pin or use -LocalOnly.' }
+      # Authenticate older installations using their existing certificate trust.
+      # A per-request C# callback also works in Windows PowerShell 5.1, where
+      # callbacks on TLS worker threads cannot execute PowerShell scriptblocks.
+      if (-not ('Noobtunnel.UninstallRequest' -as [type])) {
+        Add-Type -TypeDefinition @'
+namespace Noobtunnel {
+  public static class UninstallRequest {
+    public static void Send(string url, string fingerprint, string token, int timeout) {
+      System.Net.ServicePointManager.SecurityProtocol |= System.Net.SecurityProtocolType.Tls12;
+      var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+      request.Method = "POST";
+      request.AllowAutoRedirect = false;
+      request.Timeout = timeout;
+      request.ReadWriteTimeout = timeout;
+      request.ContentLength = 0;
+      request.Headers["Authorization"] = "Bearer " + token;
+      request.ServerCertificateValidationCallback = (sender, certificate, chain, errors) => {
+        if (certificate == null) return false;
+        using (var sha = System.Security.Cryptography.SHA256.Create()) {
+          string actual = System.BitConverter.ToString(sha.ComputeHash(certificate.GetRawCertData())).Replace("-", "");
+          return string.Equals(actual, fingerprint, System.StringComparison.OrdinalIgnoreCase);
+        }
+      };
+      using (var response = (System.Net.HttpWebResponse)request.GetResponse()) {
+        if (response.StatusCode != System.Net.HttpStatusCode.OK) throw new System.Exception("Control node removal failed.");
+      }
+    }
+  }
+}
+'@
+      }
+      [Noobtunnel.UninstallRequest]::Send("https://$Server/api/agent-uninstall/$AgentId", $expectedFingerprint, $localToken, ([Math]::Min(30, (Get-RemainingSetupSeconds)) * 1000))
+    }
   }
   $service = Get-Service -Name 'noobtunnel-agent' -ErrorAction SilentlyContinue
   if ($service) {
@@ -80,6 +148,8 @@ if ($Uninstall) {
   exit 0
 }
 
+if ($Server -notmatch '^[A-Za-z0-9.\-]+:\d+$') { throw 'Invalid control server address.' }
+if ($Pin -notmatch '^[A-Za-z0-9+/]{43}=$') { throw 'Invalid certificate pin.' }
 if (-not [Environment]::Is64BitOperatingSystem) { throw 'This installer currently supports 64-bit Windows only.' }
 if (-not $Token -or -not $Name) { throw 'Token and name are required.' }
 # The control node formats SHA-256 fingerprints as colon-separated hex.
@@ -148,6 +218,7 @@ if (Test-Path -LiteralPath $runtimePath) { Remove-Item -LiteralPath $runtimePath
 Copy-Item -LiteralPath $download -Destination $binary -Force
 & icacls.exe $state /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Could not secure the agent state directory.' }
+@{server=$Server;pin=$Pin} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $state 'uninstall.json') -Encoding UTF8
 Set-Content -LiteralPath $tokenFile -Value $Token -NoNewline -Encoding Ascii
 & icacls.exe $tokenFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Could not secure the enrollment token.' }
