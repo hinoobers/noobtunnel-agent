@@ -118,9 +118,22 @@ func resolveWindowsEndpoint(ctx context.Context, endpoint string) (string, error
 }
 
 func windowsFirewallScript(iface string) string {
-	// Windows stores InterfaceAlias as the adapter GUID. Wintun can assign a new
-	// GUID after an agent restart, so an existing rule must be rebound too.
-	return fmt.Sprintf("if (Get-NetFirewallRule -Name 'noobtunnel-mesh' -ErrorAction SilentlyContinue) { Set-NetFirewallRule -Name 'noobtunnel-mesh' -InterfaceAlias '%s' -Enabled True | Out-Null } else { New-NetFirewallRule -Name 'noobtunnel-mesh' -DisplayName 'noobtunnel mesh' -Direction Inbound -Action Allow -InterfaceAlias '%s' | Out-Null }", iface, iface)
+	return fmt.Sprintf(`$meshRule=Get-NetFirewallRule -Name 'noobtunnel-mesh' -ErrorAction SilentlyContinue;
+$meshBindings=@();
+if ($meshRule) {
+  try { $meshBindings=@($meshRule | Get-NetFirewallInterfaceFilter -ErrorAction Stop | ForEach-Object { $_.InterfaceAlias }) } catch { $meshBindings=@() }
+}
+$newMeshRule={ New-NetFirewallRule -Name 'noobtunnel-mesh' -DisplayName 'noobtunnel mesh' -Direction Inbound -Action Allow -Profile Any -InterfaceAlias '%s' -ErrorAction Stop | Out-Null };
+if (-not $meshRule) {
+  & $newMeshRule
+} elseif (@($meshRule).Count -ne 1 -or [string]$meshRule.Enabled -ne 'True' -or [string]$meshRule.Direction -ne 'Inbound' -or [string]$meshRule.Action -ne 'Allow' -or [string]$meshRule.Profile -ne 'Any' -or $meshBindings.Count -ne 1 -or $meshBindings[0] -ne '%s') {
+  try {
+    Set-NetFirewallRule -Name 'noobtunnel-mesh' -InterfaceAlias '%s' -Enabled True -Direction Inbound -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+  } catch {
+    Remove-NetFirewallRule -Name 'noobtunnel-mesh' -ErrorAction Stop;
+    & $newMeshRule
+  }
+}`, iface, iface, iface)
 }
 
 func windowsIPC(cfg Config) (string, error) {
