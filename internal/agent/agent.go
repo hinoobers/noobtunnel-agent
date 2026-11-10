@@ -381,6 +381,7 @@ func (a *Agent) controlSession(ctx context.Context) (sessionErr error) {
 	}
 	hostname, _ := os.Hostname()
 	hello := proto.Hello{
+		POPPull:           true,
 		ControlHeartbeat:  true,
 		ControllerOrigins: true,
 		T:                 proto.THello,
@@ -398,7 +399,7 @@ func (a *Agent) controlSession(ctx context.Context) (sessionErr error) {
 		return writeErr
 	}
 
-	writer := &connWriter{conn: conn}
+	writer := &connWriter{conn: conn, popUpdates: make(chan struct{}, 1)}
 	var idleWatch atomic.Bool
 	msgs := make(chan rawMessage, 128)
 	readErr := make(chan error, 1)
@@ -441,6 +442,12 @@ func (a *Agent) controlSession(ctx context.Context) (sessionErr error) {
 		"backend", a.backend.Name())
 	moveCtx, stopMoves := context.WithCancel(ctx)
 	defer stopMoves()
+	popDone := make(chan struct{})
+	go func() {
+		defer close(popDone)
+		a.watchPOPUpdates(moveCtx, conn.RemoteAddr().String(), writer.popUpdates)
+	}()
+	defer func() { stopMoves(); <-popDone }()
 	moves := make(chan controlMove)
 	go a.watchControlPOPs(moveCtx, conn.RemoteAddr().String(), moves)
 	meshDone := make(chan struct{})
@@ -648,6 +655,12 @@ func (a *Agent) handleFirstMessage(msg rawMessage) error {
 
 func (a *Agent) handleMessage(msg rawMessage, writer *connWriter) error {
 	switch msg.typ {
+	case proto.TPOPsChanged:
+		select {
+		case writer.popUpdates <- struct{}{}:
+		default:
+		}
+		return nil
 	case proto.TPeers:
 		var p proto.Peers
 		if err := json.Unmarshal(msg.raw, &p); err != nil {
@@ -1205,8 +1218,9 @@ func unixNanoOrZero(t time.Time) int64 {
 
 // connWriter serialises writes to the control connection.
 type connWriter struct {
-	mu   sync.Mutex
-	conn net.Conn
+	popUpdates chan struct{}
+	mu         sync.Mutex
+	conn       net.Conn
 }
 
 func (w *connWriter) send(v any) error {

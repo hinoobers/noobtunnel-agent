@@ -22,7 +22,7 @@ const (
 	controlIdleTimeout        = 10 * time.Second
 	controlRaceDelay          = 150 * time.Millisecond
 	controlPreferredRaceDelay = 1500 * time.Millisecond
-	maxControlAddresses       = 8
+	maxControlAddresses       = 64
 )
 
 func reconnectDelay(backoff time.Duration) time.Duration {

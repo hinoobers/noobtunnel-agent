@@ -33,19 +33,20 @@ const MaxMessageSize = 1 << 20
 
 // Control channel message types.
 const (
-	THello    = "hello"
-	TWelcome  = "welcome"
-	TPeers    = "peers"
-	TPing     = "ping"
-	TPong     = "pong"
-	TStats    = "stats"
-	TLog      = "log"
-	TError    = "error"
-	TRevoked  = "revoked"
-	TCommand  = "command"
-	TProbe    = "probeResult"
-	TCounters = "counterResult"
-	TBye      = "bye"
+	THello       = "hello"
+	TWelcome     = "welcome"
+	TPOPsChanged = "popsChanged"
+	TPeers       = "peers"
+	TPing        = "ping"
+	TPong        = "pong"
+	TStats       = "stats"
+	TLog         = "log"
+	TError       = "error"
+	TRevoked     = "revoked"
+	TCommand     = "command"
+	TProbe       = "probeResult"
+	TCounters    = "counterResult"
+	TBye         = "bye"
 )
 
 // Hub describes how an agent reaches the control node's WireGuard interface.
@@ -82,6 +83,7 @@ type Peer struct {
 
 // Hello is the first message an agent sends after the TLS handshake.
 type Hello struct {
+	POPPull           bool     `json:"popPull,omitempty"`
 	ControlHeartbeat  bool     `json:"controlHeartbeat,omitempty"`
 	ControllerOrigins bool     `json:"controllerOrigins,omitempty"`
 	T                 string   `json:"t"`
@@ -350,4 +352,21 @@ func ReadRawLimit(r io.Reader, limit uint32) (string, []byte, error) {
 		return "", nil, err
 	}
 	return env.T, buf, nil
+}
+
+type POPsChanged struct {
+	T string `json:"t"`
+}
+
+type POPLocation struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Country       string `json:"country,omitempty"`
+	City          string `json:"city,omitempty"`
+	PublicAddress string `json:"publicAddress"`
+	MeshAddress   string `json:"meshAddress"`
+}
+
+type POPLocations struct {
+	POPs []POPLocation `json:"pops"`
 }
