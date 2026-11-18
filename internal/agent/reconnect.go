@@ -23,6 +23,7 @@ const (
 	controlRaceDelay          = 150 * time.Millisecond
 	controlPreferredRaceDelay = 1500 * time.Millisecond
 	maxControlAddresses       = 64
+	controlMeasurementMaxAge  = 5 * time.Minute
 )
 
 func reconnectDelay(backoff time.Duration) time.Duration {
@@ -31,10 +32,21 @@ func reconnectDelay(backoff time.Duration) time.Duration {
 }
 
 type controlCache struct {
-	Endpoint  string    `json:"endpoint"`
-	Addresses []string  `json:"addresses"`
-	Preferred string    `json:"preferred,omitempty"`
-	LastMove  time.Time `json:"lastMove,omitempty"`
+	Endpoint     string                              `json:"endpoint"`
+	Addresses    []string                            `json:"addresses"`
+	Preferred    string                              `json:"preferred,omitempty"`
+	LastMove     time.Time                           `json:"lastMove,omitempty"`
+	Measurements map[string]cachedControlMeasurement `json:"measurements,omitempty"`
+}
+
+type cachedControlMeasurement struct {
+	RTT    time.Duration `json:"rtt"`
+	At     time.Time     `json:"at"`
+	Failed bool          `json:"failed,omitempty"`
+}
+
+func (m cachedControlMeasurement) fresh(now time.Time) bool {
+	return !m.At.IsZero() && !m.At.After(now) && now.Sub(m.At) <= controlMeasurementMaxAge
 }
 
 func publicControls(addresses []string) []string {
@@ -74,6 +86,16 @@ func (a *Agent) loadControls() {
 		if saved.LastMove.Before(time.Now()) {
 			a.lastControlMove = saved.LastMove
 		}
+		_, port, err := net.SplitHostPort(a.opts.ControlEndpoint)
+		if err == nil {
+			a.controlMeasurements = make(map[string]cachedControlMeasurement)
+			for _, ip := range a.controlAddresses {
+				target := net.JoinHostPort(ip, port)
+				if m, ok := saved.Measurements[target]; ok && m.fresh(time.Now()) && (m.Failed || m.RTT > 0) {
+					a.controlMeasurements[target] = m
+				}
+			}
+		}
 	}
 }
 
@@ -91,7 +113,7 @@ func (a *Agent) saveControls() {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	raw, _ := json.Marshal(controlCache{Endpoint: a.opts.ControlEndpoint, Addresses: a.controlAddresses, Preferred: a.preferredControl, LastMove: a.lastControlMove})
+	raw, _ := json.Marshal(controlCache{Endpoint: a.opts.ControlEndpoint, Addresses: a.controlAddresses, Preferred: a.preferredControl, LastMove: a.lastControlMove, Measurements: a.controlMeasurements})
 	path := filepath.Join(a.opts.StateDir, "control-peers.json")
 	if err := os.WriteFile(path+".tmp", raw, 0600); err != nil {
 		return
@@ -153,11 +175,23 @@ func (a *Agent) controlTargets(ctx context.Context, host, port string) ([]string
 		return nil, errors.New("agent: control hostname has no addresses")
 	}
 	a.mu.Lock()
+	now := time.Now()
 	sort.SliceStable(targets, func(i, j int) bool {
 		failedI, failedJ := a.failedControls[targets[i]], a.failedControls[targets[j]]
-		badI, badJ := !failedI.IsZero() && time.Since(failedI) <= 10*time.Second, !failedJ.IsZero() && time.Since(failedJ) <= 10*time.Second
+		mi, mj := a.controlMeasurements[targets[i]], a.controlMeasurements[targets[j]]
+		freshI, freshJ := mi.fresh(now), mj.fresh(now)
+		badI := (!failedI.IsZero() && now.Sub(failedI) <= 10*time.Second) || (freshI && mi.Failed)
+		badJ := (!failedJ.IsZero() && now.Sub(failedJ) <= 10*time.Second) || (freshJ && mj.Failed)
 		if badI != badJ {
 			return !badI
+		}
+		// Fresh RTTs take precedence over the saved POP preference.
+		measuredI, measuredJ := freshI && !mi.Failed && mi.RTT > 0, freshJ && !mj.Failed && mj.RTT > 0
+		if measuredI != measuredJ {
+			return measuredI
+		}
+		if measuredI && mi.RTT != mj.RTT {
+			return mi.RTT < mj.RTT
 		}
 		return targets[i] == net.JoinHostPort(a.preferredControl, port) && targets[j] != net.JoinHostPort(a.preferredControl, port)
 	})
@@ -193,6 +227,11 @@ func (a *Agent) dial(ctx context.Context) (net.Conn, error) {
 	preferFirst := a.preferredControl != "" && targets[0] == net.JoinHostPort(a.preferredControl, port)
 	failedAt := a.failedControls[targets[0]]
 	preferFirst = preferFirst && (failedAt.IsZero() || time.Since(failedAt) > 10*time.Second)
+	measurement := a.controlMeasurements[targets[0]]
+	// Give the fastest measured POP a bounded head start.
+	if measurement.fresh(time.Now()) {
+		preferFirst = !measurement.Failed && measurement.RTT > 0 && (failedAt.IsZero() || time.Since(failedAt) > 10*time.Second)
+	}
 	a.mu.Unlock()
 	for index, target := range targets {
 		go func(index int, target string) {
@@ -237,7 +276,7 @@ func (a *Agent) dial(ctx context.Context) (net.Conn, error) {
 	return nil, lastErr
 }
 
-func startControlHeartbeat(ctx context.Context, conn net.Conn, writer *connWriter, interval time.Duration) context.CancelFunc {
+func startControlHeartbeat(ctx context.Context, conn net.Conn, writer *connWriter, interval time.Duration, reports ...func() map[string][]float64) context.CancelFunc {
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -249,7 +288,11 @@ func startControlHeartbeat(ctx context.Context, conn net.Conn, writer *connWrite
 				return
 			case <-ticker.C:
 				seq++
-				if err := writer.send(proto.Ping{T: proto.TPing, Seq: seq}); err != nil {
+				ping := proto.Ping{T: proto.TPing, Seq: seq}
+				if len(reports) > 0 {
+					ping.POPLatency = reports[0]()
+				}
+				if err := writer.send(ping); err != nil {
 					_ = conn.Close()
 					return
 				}
@@ -257,4 +300,14 @@ func startControlHeartbeat(ctx context.Context, conn net.Conn, writer *connWrite
 		}
 	}()
 	return cancel
+}
+
+func (a *Agent) takeControlLatencyReport() map[string][]float64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if time.Since(a.controlLatencyReportAt) < time.Minute || time.Since(a.controlLatencyAt) > 45*time.Second || len(a.controlLatencySamples) < 2 {
+		return nil
+	}
+	a.controlLatencyReportAt = time.Now()
+	return a.controlLatencySamples
 }

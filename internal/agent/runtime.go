@@ -14,20 +14,21 @@ import (
 // identity file so `noobtunnel status` works without talking to the control
 // node.
 type RuntimeState struct {
-	Address     string    `json:"address,omitempty"`
-	MeshCIDR    string    `json:"meshCidr,omitempty"`
-	Interface   string    `json:"interface,omitempty"`
-	HubEndpoint string    `json:"hubEndpoint,omitempty"`
-	ControlNode string    `json:"controlNode,omitempty"`
-	AgentName   string    `json:"agentName,omitempty"`
-	AgentID     uint32    `json:"agentId,omitempty"`
-	Connected   bool      `json:"connected"`
-	Peers       []PeerRow `json:"peers,omitempty"`
-	Routes      []string  `json:"routes,omitempty"`
-	MTU         int       `json:"mtu,omitempty"`
-	Backend     string    `json:"backend,omitempty"`
-	LastError   string    `json:"lastError,omitempty"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	Address      string    `json:"address,omitempty"`
+	MeshCIDR     string    `json:"meshCidr,omitempty"`
+	Interface    string    `json:"interface,omitempty"`
+	HubEndpoint  string    `json:"hubEndpoint,omitempty"`
+	ControlNode  string    `json:"controlNode,omitempty"`
+	AgentName    string    `json:"agentName,omitempty"`
+	AgentID      uint32    `json:"agentId,omitempty"`
+	Connected    bool      `json:"connected"`
+	LoopbackOnly bool      `json:"loopbackOnly"`
+	Peers        []PeerRow `json:"peers,omitempty"`
+	Routes       []string  `json:"routes,omitempty"`
+	MTU          int       `json:"mtu,omitempty"`
+	Backend      string    `json:"backend,omitempty"`
+	LastError    string    `json:"lastError,omitempty"`
+	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
 // PeerRow is one mesh peer as this agent sees it.
@@ -78,6 +79,9 @@ func writeRuntime(stateDir string, st *RuntimeState) error {
 	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
 		return err
 	}
+	if err := allowPublicRead(tmp, false); err != nil {
+		return err
+	}
 	return os.Rename(tmp, path)
 }
 
@@ -90,6 +94,7 @@ func (r *RuntimeState) Describe() string {
 	fmt.Fprintf(&b, "interface      %s (mtu %d, backend %s)\n", orDash(r.Interface), r.MTU, orDash(r.Backend))
 	fmt.Fprintf(&b, "hub endpoint   %s\n", orDash(r.HubEndpoint))
 	fmt.Fprintf(&b, "control state  %s\n", map[bool]string{true: "connected", false: "disconnected"}[r.Connected])
+	fmt.Fprintf(&b, "loopback-only  %s\n", map[bool]string{true: "on", false: "off"}[r.LoopbackOnly])
 	fmt.Fprintf(&b, "updated        %s\n", r.UpdatedAt.Local().Format(time.RFC3339))
 	if r.LastError != "" {
 		fmt.Fprintf(&b, "last error     %s\n", r.LastError)

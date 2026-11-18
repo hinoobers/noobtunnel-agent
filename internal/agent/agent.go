@@ -61,9 +61,10 @@ type Options struct {
 	KeepInterface bool
 	// SetupSystem opens the host firewall for the mesh interface at startup. It is
 	// on by default in the CLI; false leaves the firewall completely alone.
-	SetupSystem bool
-	Logger      *slog.Logger
-	Backend     wg.Backend
+	SetupSystem  bool
+	LoopbackOnly bool
+	Logger       *slog.Logger
+	Backend      wg.Backend
 	// DialTimeout bounds a single control connection attempt.
 	DialTimeout time.Duration
 }
@@ -123,6 +124,10 @@ type Agent struct {
 	lastErr                   string
 	controlAddresses          []string
 	failedControls            map[string]time.Time
+	controlMeasurements       map[string]cachedControlMeasurement
+	controlLatencySamples     map[string][]float64
+	controlLatencyAt          time.Time
+	controlLatencyReportAt    time.Time
 	lookupControl             func(context.Context, string) ([]net.IPAddr, error)
 	dialControl               func(context.Context, string, string) (net.Conn, error)
 	preferredControl          string
@@ -170,6 +175,9 @@ func New(opts Options) (*Agent, error) {
 	if opts.Interface == "" {
 		opts.Interface = "noobtun"
 	}
+	if _, err := LoadForwardPolicy(opts.StateDir); err != nil {
+		return nil, err
+	}
 	if opts.WGListenPort < 0 || opts.WGListenPort > 65535 {
 		return nil, fmt.Errorf("agent: WireGuard listen port %d is invalid", opts.WGListenPort)
 	}
@@ -188,6 +196,9 @@ func New(opts Options) (*Agent, error) {
 	identity, err := LoadIdentity(opts.StateDir)
 	if err != nil {
 		return nil, err
+	}
+	if err := allowPublicRead(opts.StateDir, true); err != nil {
+		return nil, fmt.Errorf("agent state directory access: %w", err)
 	}
 	a := &Agent{
 		opts:      opts,
@@ -238,6 +249,7 @@ func (a *Agent) saveRuntime(ctx context.Context) {
 		Backend:     a.backend.Name(),
 		LastError:   a.lastError(),
 	}
+	st.LoopbackOnly, _ = a.loopbackOnly()
 	welcome, peers, direct, _, ok := a.snapshot()
 	if ok {
 		st.AgentID = welcome.AgentID
@@ -391,6 +403,8 @@ func (a *Agent) controlSession(ctx context.Context) (sessionErr error) {
 		Advertise:         a.advertise,
 		Direct:            a.opts.Direct,
 	}
+	loopbackOnly, _ := a.loopbackOnly()
+	hello.LoopbackOnly = &loopbackOnly
 	if writeErr := proto.WriteJSON(conn, hello); writeErr != nil {
 		return writeErr
 	}
@@ -421,7 +435,7 @@ func (a *Agent) controlSession(ctx context.Context) (sessionErr error) {
 	if heartbeat {
 		idleWatch.Store(true)
 		_ = conn.SetReadDeadline(time.Now().Add(controlIdleTimeout))
-		stop := startControlHeartbeat(ctx, conn, writer, controlHeartbeatInterval)
+		stop := startControlHeartbeat(ctx, conn, writer, controlHeartbeatInterval, a.takeControlLatencyReport)
 		defer stop()
 	}
 	a.setConnected(true)
@@ -469,7 +483,10 @@ func (a *Agent) controlSession(ctx context.Context) (sessionErr error) {
 			}
 			return err
 		case move := <-moves:
-			a.acceptControlMove(move)
+			if !a.acceptControlMove(move) {
+				go a.watchControlPOPs(moveCtx, conn.RemoteAddr().String(), moves)
+				continue
+			}
 			return errReconnectRequest
 		case msg := <-msgs:
 			if err := a.handleMessage(msg, writer); err != nil {
@@ -655,10 +672,19 @@ func (a *Agent) handleMessage(msg rawMessage, writer *connWriter) error {
 			return err
 		}
 		a.mu.Lock()
+		transferPolicyChanged := false
+		if a.session != nil && p.AllowFasterPOPTransfer != nil {
+			value := *p.AllowFasterPOPTransfer
+			transferPolicyChanged = a.fasterPOPTransferAllowedLocked() != value
+			a.session.welcome.AllowFasterPOPTransfer = &value
+		}
 		if a.session != nil && len(p.HubEndpoints) > 0 {
 			a.session.welcome.Hub.Endpoints = append([]string(nil), p.HubEndpoints...)
 		}
 		a.mu.Unlock()
+		if transferPolicyChanged {
+			a.log.Info("faster POP transfer policy updated", "allowed", *p.AllowFasterPOPTransfer)
+		}
 		a.updatePeers(p.Generation, p.Peers, p.SelfMeshDNS)
 		a.syncMeshDNS()
 		// The membership message carries what the mesh routes through this agent,
@@ -1007,6 +1033,8 @@ func (a *Agent) collectStats(ctx context.Context) proto.Stats {
 		Networks:  localNetworkCandidates(a.opts.Interface),
 		LastError: a.lastError(),
 	}
+	loopbackOnly, _ := a.loopbackOnly()
+	stats.LoopbackOnly = &loopbackOnly
 	if ok {
 		stats.Generation = generation
 	}

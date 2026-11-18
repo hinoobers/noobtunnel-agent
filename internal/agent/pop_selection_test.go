@@ -22,6 +22,26 @@ func measurement(best, worst int) controlMeasurement {
 	return controlMeasurement{best: time.Duration(best) * time.Millisecond, worst: time.Duration(worst) * time.Millisecond}
 }
 
+func TestDisabledTransferCancelsPreparedMoveWithoutChangingControl(t *testing.T) {
+	no := false
+	a := &Agent{session: &sessionState{welcome: proto.Welcome{AllowFasterPOPTransfer: &no}}, preferredControl: "8.8.8.8"}
+	client, server := net.Pipe()
+	defer server.Close()
+	if a.acceptControlMove(controlMove{conn: client, target: "1.1.1.1:8443"}) {
+		t.Fatal("disabled transfer accepted")
+	}
+	if a.preferredControl != "8.8.8.8" || a.nextControlConn != nil || !a.lastControlMove.IsZero() {
+		t.Fatal("disabled transfer changed session")
+	}
+	if _, err := server.Write([]byte{1}); err == nil {
+		t.Fatal("unused warm connection left open")
+	}
+	a.session.welcome.AllowFasterPOPTransfer = nil
+	if !a.fasterPOPTransferAllowedLocked() {
+		t.Fatal("older controllers lost default behavior")
+	}
+}
+
 func TestPOPSelectionRequiresSustainedFasterMeasurements(t *testing.T) {
 	cases := []struct {
 		name               string
@@ -158,6 +178,9 @@ func TestPOPProbeUsesPinnedTLSAndLocalResponsesWithoutEnrollment(t *testing.T) {
 	m := a.measureControlPOP(context.Background(), server.Listener.Addr().String(), "control.example.com")
 	if m.err != nil || m.best <= 0 || m.worst < m.best || requests.Load() != 3 {
 		t.Fatal("probe failed", m, requests.Load())
+	}
+	if m.popID != "test" || len(m.samples) != 3 {
+		t.Fatal("authenticated transport lost actual measurements", m)
 	}
 	a.opts.Fingerprint = strings.Repeat("0", 64)
 	if a.measureControlPOP(context.Background(), server.Listener.Addr().String(), "control.example.com").err == nil {

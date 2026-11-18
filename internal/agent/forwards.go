@@ -36,6 +36,7 @@ type forwarder struct {
 	resolvedTarget string
 	port           int
 	network        string
+	loopbackOnly   bool
 
 	mu           sync.Mutex
 	ln           net.Listener
@@ -46,6 +47,10 @@ type forwarder struct {
 
 // syncForwards reconciles listeners and retries pending mesh-address binds.
 func (a *Agent) syncForwards(ctx context.Context) {
+	loopbackOnly, policyErr := a.loopbackOnly()
+	if policyErr != nil {
+		a.setLastError(policyErr.Error())
+	}
 	a.mu.Lock()
 	if a.session == nil {
 		a.mu.Unlock()
@@ -69,10 +74,14 @@ func (a *Agent) syncForwards(ctx context.Context) {
 		}
 		key := forwardKey{network: network, port: want.Port}
 		if existing, ok := current[key]; ok && existing.target == want.Target {
-			next[key] = existing
-			continue
+			pinned, pinErr := resolveLoopbackTarget(want.Target)
+			if existing.loopbackOnly == loopbackOnly || !loopbackOnly || (pinErr == nil && existing.resolvedTarget == pinned) {
+				existing.loopbackOnly = loopbackOnly
+				next[key] = existing
+				continue
+			}
 		}
-		next[key] = &forwarder{agent: a, target: want.Target, port: want.Port, network: network, done: make(chan struct{})}
+		next[key] = &forwarder{agent: a, target: want.Target, port: want.Port, network: network, loopbackOnly: loopbackOnly, done: make(chan struct{})}
 	}
 	a.forwards = next
 	a.mu.Unlock()
@@ -115,7 +124,13 @@ func (a *Agent) syncForwards(ctx context.Context) {
 // start opens the listener on the agent's mesh address, which is the only place
 // the control node can reach it.
 func (f *forwarder) start(ctx context.Context, mesh netip.Addr) error {
-	resolved, err := resolveForwardTarget(f.target)
+	var resolved string
+	var err error
+	if f.loopbackOnly {
+		resolved, err = resolveLoopbackTarget(f.target)
+	} else {
+		resolved, err = resolveForwardTarget(f.target)
+	}
 	if err != nil {
 		return err
 	}

@@ -23,6 +23,7 @@ ADVERTISE=""
 IFACE=""
 DIRECT="1"
 KEEP="0"
+LOOPBACK_ONLY="0"
 UNINSTALL="0"
 PURGE="0"
 REMOVE_REMOTE=""
@@ -208,6 +209,7 @@ noobtunnel agent installer
   --interface NAME       WireGuard interface name (default noobtun)
   --no-direct            never attempt direct paths, always relay
   --keep-interface       leave the WireGuard device up when the agent stops
+  --loopback-only        restrict service forwarding to loopback addresses
   --uninstall            remove the agent
   --purge                with --uninstall, also remove the machine identity
   --remove-remote ID     with --uninstall, revoke this agent on the control node
@@ -238,6 +240,7 @@ while [ "$#" -gt 0 ]; do
 		--state-dir)   arg_value "$@"; STATE_DIR="$2"; shift 2 ;;
 		--no-direct)   DIRECT="0"; shift ;;
 		--keep-interface) KEEP="1"; shift ;;
+		--loopback-only) LOOPBACK_ONLY="1"; shift ;;
 		--uninstall)   UNINSTALL="1"; shift ;;
 		--purge)       PURGE="1"; shift ;;
 		--remove-remote) arg_value "$@"; REMOVE_REMOTE="$2"; shift 2 ;;
@@ -251,6 +254,15 @@ done
 
 [ -z "$REMOVE_REMOTE" ] || [ "$UNINSTALL" = "1" ] || die "--remove-remote requires --uninstall"
 [ "$(id -u)" = "0" ] || die "please run as root, for example: curl ... | sudo sh -s -- ..."
+
+write_loopback_policy() {
+	[ "$LOOPBACK_ONLY" = "1" ] || return 0
+	mkdir -p "$1"
+	policy_tmp="$(mktemp "$1/.forward-policy.XXXXXX")"
+	printf '%s\n' '{"loopbackOnly":true}' > "$policy_tmp"
+	chmod 0644 "$policy_tmp"
+	mv -f "$policy_tmp" "$1/forward-policy.json"
+}
 
 stop_service() {
 	if command -v systemctl >/dev/null 2>&1; then
@@ -651,6 +663,7 @@ COMPOSE_TAIL
 	fi
 
 	log "building the image and starting the container"
+	write_loopback_policy "${DIR}/noobtunnel-state"
 	compose_run up -d --build ||
 		die "docker compose could not start the container" "read the output above, then run: docker compose up -d --build"
 
@@ -763,6 +776,7 @@ umask 077
 chmod 0600 "$ENV_FILE"
 
 log "installing the systemd service"
+write_loopback_policy "$STATE_DIR"
 cat > "$UNIT" <<EOF
 [Unit]
 Description=noobtunnel mesh agent

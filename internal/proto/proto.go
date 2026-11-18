@@ -83,6 +83,7 @@ type Peer struct {
 
 // Hello is the first message an agent sends after the TLS handshake.
 type Hello struct {
+	LoopbackOnly      *bool    `json:"loopbackOnly,omitempty"`
 	POPPull           bool     `json:"popPull,omitempty"`
 	ControlHeartbeat  bool     `json:"controlHeartbeat,omitempty"`
 	ControllerOrigins bool     `json:"controllerOrigins,omitempty"`
@@ -102,22 +103,23 @@ type Hello struct {
 
 // Welcome is the answer to a successful Hello.
 type Welcome struct {
-	ControlHeartbeat bool     `json:"controlHeartbeat,omitempty"`
-	ControlAddresses []string `json:"controlAddresses,omitempty"`
-	T                string   `json:"t"`
-	AgentID          uint32   `json:"agentId"`
-	Name             string   `json:"name"`
-	MeshDNS          string   `json:"meshDns,omitempty"`
-	Address          string   `json:"address"`
-	Prefix           int      `json:"prefix"`
-	MeshCIDR         string   `json:"meshCidr"`
-	MTU              int      `json:"mtu"`
-	KeepaliveSec     int      `json:"keepaliveSec"`
-	Interface        string   `json:"interface"`
-	Generation       uint64   `json:"generation"`
-	ServerTime       int64    `json:"serverTime"`
-	Hub              Hub      `json:"hub"`
-	Peers            []Peer   `json:"peers"`
+	AllowFasterPOPTransfer *bool    `json:"allowFasterPOPTransfer,omitempty"`
+	ControlHeartbeat       bool     `json:"controlHeartbeat,omitempty"`
+	ControlAddresses       []string `json:"controlAddresses,omitempty"`
+	T                      string   `json:"t"`
+	AgentID                uint32   `json:"agentId"`
+	Name                   string   `json:"name"`
+	MeshDNS                string   `json:"meshDns,omitempty"`
+	Address                string   `json:"address"`
+	Prefix                 int      `json:"prefix"`
+	MeshCIDR               string   `json:"meshCidr"`
+	MTU                    int      `json:"mtu"`
+	KeepaliveSec           int      `json:"keepaliveSec"`
+	Interface              string   `json:"interface"`
+	Generation             uint64   `json:"generation"`
+	ServerTime             int64    `json:"serverTime"`
+	Hub                    Hub      `json:"hub"`
+	Peers                  []Peer   `json:"peers"`
 	// Carry is what the mesh routes through this agent, as resolved by the
 	// control node (see Peers.Carry).
 	Carry []string `json:"carry,omitempty"`
@@ -131,11 +133,12 @@ type Welcome struct {
 
 // Peers is a full membership snapshot; agents replace their view with it.
 type Peers struct {
-	HubEndpoints []string `json:"hubEndpoints,omitempty"`
-	T            string   `json:"t"`
-	Generation   uint64   `json:"generation"`
-	SelfMeshDNS  string   `json:"selfMeshDns,omitempty"`
-	Peers        []Peer   `json:"peers"`
+	AllowFasterPOPTransfer *bool    `json:"allowFasterPOPTransfer,omitempty"`
+	HubEndpoints           []string `json:"hubEndpoints,omitempty"`
+	T                      string   `json:"t"`
+	Generation             uint64   `json:"generation"`
+	SelfMeshDNS            string   `json:"selfMeshDns,omitempty"`
+	Peers                  []Peer   `json:"peers"`
 	// Carry lists networks the controller routes through this agent.
 	Carry []string `json:"carry,omitempty"`
 	// Forwards lists controller-selected service targets reached through this agent.
@@ -152,8 +155,9 @@ type Forward struct {
 
 // Ping asks the agent to answer with a Pong.
 type Ping struct {
-	T   string `json:"t"`
-	Seq uint64 `json:"seq"`
+	POPLatency map[string][]float64 `json:"popLatency,omitempty"`
+	T          string               `json:"t"`
+	Seq        uint64               `json:"seq"`
 }
 
 // Pong answers a Ping.
@@ -182,18 +186,19 @@ type NetworkCandidate struct {
 }
 
 type Stats struct {
-	T          string             `json:"t"`
-	UptimeSec  int64              `json:"uptimeSec"`
-	RxBytes    uint64             `json:"rxBytes"`
-	TxBytes    uint64             `json:"txBytes"`
-	PeerStats  []PeerStat         `json:"peerStats,omitempty"`
-	Interface  string             `json:"interface,omitempty"`
-	MTU        int                `json:"mtu,omitempty"`
-	Routes     []string           `json:"routes,omitempty"`
-	Networks   []NetworkCandidate `json:"networks,omitempty"`
-	LastError  string             `json:"lastError,omitempty"`
-	Generation uint64             `json:"generation"`
-	Backend    string             `json:"backend,omitempty"`
+	LoopbackOnly *bool              `json:"loopbackOnly,omitempty"`
+	T            string             `json:"t"`
+	UptimeSec    int64              `json:"uptimeSec"`
+	RxBytes      uint64             `json:"rxBytes"`
+	TxBytes      uint64             `json:"txBytes"`
+	PeerStats    []PeerStat         `json:"peerStats,omitempty"`
+	Interface    string             `json:"interface,omitempty"`
+	MTU          int                `json:"mtu,omitempty"`
+	Routes       []string           `json:"routes,omitempty"`
+	Networks     []NetworkCandidate `json:"networks,omitempty"`
+	LastError    string             `json:"lastError,omitempty"`
+	Generation   uint64             `json:"generation"`
+	Backend      string             `json:"backend,omitempty"`
 }
 
 // Log is a line from the agent's log.

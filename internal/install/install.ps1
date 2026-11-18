@@ -4,6 +4,7 @@ param(
   [string]$Fingerprint,
   [string]$Pin,
   [string]$Name,
+  [switch]$LoopbackOnly,
   [switch]$Uninstall,
   [switch]$LocalOnly,
   [uint32]$AgentId,
@@ -31,6 +32,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     $reentry = '& ' + (PSQuote $PSCommandPath) + ' -Server ' + (PSQuote $Server) +
       ' -Token ' + (PSQuote $Token) + ' -Fingerprint ' + (PSQuote $Fingerprint) +
       ' -Pin ' + (PSQuote $Pin) + ' -Name ' + (PSQuote $Name)
+    if ($LoopbackOnly) { $reentry += ' -LoopbackOnly' }
   }
   $reentry += ' -Deadline ' + $Deadline
   # Preserve the result in the administrator window and report the real status.
@@ -46,6 +48,17 @@ $state = Join-Path $env:ProgramData 'noobtunnel'
 $binary = Join-Path $root 'noobtunnel.exe'
 $dll = Join-Path $root 'wintun.dll'
 $tokenFile = Join-Path $state 'token'
+
+function Set-NoobtunnelCommandPath([bool]$Installed) {
+  $current = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+  $existing = @($current -split ';')
+  $present = @($existing | Where-Object { $_ -and $_.TrimEnd('\') -eq $root.TrimEnd('\') }).Count -gt 0
+  if ($Installed -eq $present) { return }
+  $entries = @($existing | Where-Object { -not $_ -or $_.TrimEnd('\') -ne $root.TrimEnd('\') })
+  if ($Installed) { $entries += $root }
+  $updated = $entries -join ';'
+  if ($updated -ne $current) { [Environment]::SetEnvironmentVariable('Path', $updated, 'Machine') }
+}
 
 if ($Uninstall) {
   if (-not $LocalOnly) {
@@ -138,6 +151,7 @@ namespace Noobtunnel {
     if ($LASTEXITCODE -ne 0) { throw 'Could not remove the Windows service.' }
   }
   Get-NetFirewallRule -Name 'noobtunnel-mesh' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+  Set-NoobtunnelCommandPath $false
   foreach ($target in @($root, $state)) {
     $resolved = [IO.Path]::GetFullPath($target)
     if ([IO.Path]::GetFileName($resolved) -ne 'noobtunnel' -or (Get-Item -LiteralPath $resolved -ErrorAction SilentlyContinue).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Unsafe uninstall directory.' }
@@ -214,16 +228,29 @@ if ($service -and $service.Status -ne 'Stopped') {
 }
 $runtimePath = Join-Path $state 'runtime.json'
 if (Test-Path -LiteralPath $runtimePath) { Remove-Item -LiteralPath $runtimePath -Force }
+if ($LoopbackOnly) {
+  $policyTemp = Join-Path $state ('.forward-policy-' + [Guid]::NewGuid().ToString('N'))
+  [IO.File]::WriteAllText($policyTemp, '{"loopbackOnly":true}', [Text.UTF8Encoding]::new($false))
+  Move-Item -LiteralPath $policyTemp -Destination (Join-Path $state 'forward-policy.json') -Force
+}
 [void](Get-RemainingSetupSeconds)
 Copy-Item -LiteralPath $download -Destination $binary -Force
-& icacls.exe $state /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' | Out-Null
+Set-NoobtunnelCommandPath $true
+& icacls.exe $state /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' '*S-1-5-32-545:RX' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Could not secure the agent state directory.' }
 @{server=$Server;pin=$Pin} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $state 'uninstall.json') -Encoding UTF8
 Set-Content -LiteralPath $tokenFile -Value $Token -NoNewline -Encoding Ascii
 & icacls.exe $tokenFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Could not secure the enrollment token.' }
-& icacls.exe $root /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' | Out-Null
+& icacls.exe $root /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Could not secure the agent program directory.' }
+foreach ($metadata in @('runtime.json', 'forward-policy.json')) {
+  $metadataPath = Join-Path $state $metadata
+  if (Test-Path -LiteralPath $metadataPath) {
+    & icacls.exe $metadataPath /grant:r '*S-1-5-32-545:R' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not allow local status access.' }
+  }
+}
 
 $agentArgs = @('agent', '--server', $Server, '--token-file', $tokenFile, '--fingerprint', $Fingerprint, '--name', $Name, '--state-dir', $state)
 $quoted = @($agentArgs | ForEach-Object { '"' + $_.Replace('"','\"') + '"' }) -join ' '

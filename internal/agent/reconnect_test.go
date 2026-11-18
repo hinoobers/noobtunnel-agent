@@ -3,12 +3,14 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +18,97 @@ import (
 
 	"github.com/hinoobers/noobtunnel-agent/internal/proto"
 )
+
+func TestReconnectRanksMeasuredFallbacksAndPersistsOrder(t *testing.T) {
+	const fi = "164.5.224.64"
+	const de = "89.144.8.232"
+	const hk = "178.83.121.152"
+	const nz = "143.203.221.38"
+	const us1 = "194.79.30.64"
+	const us2 = "192.166.82.186"
+	a := &Agent{opts: Options{ControlEndpoint: "control.example.com:8443", StateDir: t.TempDir()}}
+	a.lookupControl = func(context.Context, string) ([]net.IPAddr, error) { return []net.IPAddr{{IP: net.ParseIP(fi)}}, nil }
+	a.rememberControls([]string{de, fi, hk, nz, us2, us1})
+	a.preferredControl = hk // A previous fallback must not override fresh RTTs.
+	a.rememberControlMeasurements(map[string]controlMeasurement{
+		fi + ":8443": measurement(22, 26), de + ":8443": measurement(33, 39),
+		us1 + ":8443": measurement(134, 136), us2 + ":8443": measurement(158, 162),
+		hk + ":8443": measurement(226, 248), nz + ":8443": measurement(280, 300),
+	})
+	a.failedControl(fi + ":8443")
+	a.failedControl(de + ":8443")
+	targets, err := a.controlTargets(context.Background(), "control.example.com", "8443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{us1 + ":8443", us2 + ":8443", hk + ":8443", nz + ":8443"}
+	if !slices.Equal(targets[:4], want) {
+		t.Fatalf("registry order beat measured latency: %v", targets)
+	}
+	// Restore RTT rankings and mark the same failed sessions.
+	b := &Agent{opts: a.opts, lookupControl: a.lookupControl}
+	b.loadControls()
+	b.failedControl(fi + ":8443")
+	b.failedControl(de + ":8443")
+	targets, err = b.controlTargets(context.Background(), "control.example.com", "8443")
+	if err != nil || !slices.Equal(targets[:4], want) {
+		t.Fatalf("ranking lost after restart: %v %v", targets, err)
+	}
+	// A failed measurement must not retain a previously fast RTT indefinitely.
+	b.rememberControlMeasurements(map[string]controlMeasurement{us1 + ":8443": {err: errors.New("unreachable")}})
+	targets, _ = b.controlTargets(context.Background(), "control.example.com", "8443")
+	if targets[0] != us2+":8443" {
+		t.Fatalf("unreachable measured POP preferred: %v", targets)
+	}
+	b.mu.Lock()
+	b.controlMeasurements[hk+":8443"] = cachedControlMeasurement{RTT: time.Millisecond, At: time.Now().Add(-controlMeasurementMaxAge - time.Second)}
+	b.mu.Unlock()
+	targets, _ = b.controlTargets(context.Background(), "control.example.com", "8443")
+	if targets[0] != us2+":8443" {
+		t.Fatalf("stale RTT preferred: %v", targets)
+	}
+}
+
+func TestMeasuredFallbackGetsHeadStartButStillAllowsFailover(t *testing.T) {
+	for _, unavailable := range []bool{false, true} {
+		a := &Agent{opts: Options{ControlEndpoint: "control.example.com:8443", DialTimeout: 3 * time.Second}, controlAddresses: []string{"8.8.8.8", "1.1.1.1"}}
+		a.lookupControl = func(context.Context, string) ([]net.IPAddr, error) {
+			return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
+		}
+		a.rememberControlMeasurements(map[string]controlMeasurement{"1.1.1.1:8443": measurement(120, 125), "8.8.8.8:8443": measurement(220, 230)})
+		client, server := net.Pipe()
+		defer server.Close()
+		var fallback atomic.Bool
+		a.dialControl = func(ctx context.Context, target, host string) (net.Conn, error) {
+			if target == "1.1.1.1:8443" {
+				if unavailable {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				select {
+				case <-time.After(250 * time.Millisecond):
+					return client, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			fallback.Store(true)
+			return client, nil
+		}
+		start := time.Now()
+		conn, err := a.dial(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+		if fallback.Load() != unavailable {
+			t.Fatal("slower registry-first POP bypassed measured preference")
+		}
+		if unavailable && time.Since(start) > 2*time.Second {
+			t.Fatal("stalled measured POP prevented timely fallback")
+		}
+	}
+}
 
 func TestReconnectUsesAuthenticatedBackupDespiteStaleDNS(t *testing.T) {
 	a := &Agent{opts: Options{ControlEndpoint: "control.example.com:8443", DialTimeout: time.Second, StateDir: t.TempDir()}}

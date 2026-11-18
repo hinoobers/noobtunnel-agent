@@ -3,6 +3,7 @@ package install
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -20,7 +21,7 @@ func TestWindowsReinstallOverDeadAgent(t *testing.T) {
 	if err != nil {
 		t.Skip("Windows PowerShell unavailable")
 	}
-	for _, mode := range []string{"running", "stopped", "changed-controller"} {
+	for _, mode := range []string{"running", "stopped", "changed-controller", "loopback", "preserve-loopback"} {
 		t.Run(mode, func(t *testing.T) {
 			artifact := []byte("replacement agent fixture")
 			digest := fmt.Sprintf("%x", sha256.Sum256(artifact))
@@ -57,7 +58,11 @@ func TestWindowsReinstallOverDeadAgent(t *testing.T) {
 			write(filepath.Join(state, "identity.json"), "existing identity fixture")
 			write(filepath.Join(program, "noobtunnel.exe"), "old binary")
 			write(filepath.Join(program, "wintun.dll"), "existing driver fixture")
+			if mode == "preserve-loopback" {
+				write(filepath.Join(state, "forward-policy.json"), `{"loopbackOnly":true}`)
+			}
 			source := string(WindowsScript())
+			source = strings.ReplaceAll(source, "'Machine'", "'Process'")
 			start := strings.Index(source, "$identity = [Security.Principal.WindowsIdentity]")
 			end := strings.Index(source[start:], "[void](Get-RemainingSetupSeconds)") + start
 			source = source[:start] + source[end:]
@@ -85,7 +90,11 @@ function Stop-Service { param($Name,[switch]$Force); $global:fixtureService.Stat
 function Get-CimInstance { param($ClassName,$Filter); return [pscustomobject]@{PathName=%s} }
 function Invoke-CimMethod { param($InputObject,$MethodName,$Arguments); if ($Arguments.PathName -notlike '*"%s"*') {throw 'wrong controller in service update'}; $global:fixtureChanged=$true; return [pscustomobject]@{ReturnValue=0} }
 function New-Service { throw 'created duplicate service' }
-function icacls.exe { $global:LASTEXITCODE=0 }
+function icacls.exe {
+ if ($args[0] -eq (Join-Path $env:ProgramFiles 'noobtunnel') -and $args -notcontains '*S-1-5-32-545:(OI)(CI)RX') { throw 'Program files must be readable and executable' }
+ if ($args[0] -eq (Join-Path $env:ProgramData 'noobtunnel') -and ($args -notcontains '*S-1-5-32-545:RX' -or $args -contains '*S-1-5-32-545:(OI)(CI)RX')) { throw 'State directory access must not be inherited by credentials' }
+ $global:LASTEXITCODE=0
+}
 function Start-Service {
  param($Name)
  $state=Join-Path $env:ProgramData 'noobtunnel'
@@ -101,6 +110,9 @@ if (-not $global:fixtureStarted) {throw 'service never restarted'}
 if ($global:fixtureStopped -ne $%s) {throw 'wrong stop behavior'}
 if ($global:fixtureChanged -ne $%s) {throw 'wrong service update behavior'}
 `, q(programs), q(data), q(dir), q(status), q(oldCommand), endpoint, digest, endpoint, q(installer), q(endpoint), q(fingerprint), q(base64.StdEncoding.EncodeToString(pin[:])), fmt.Sprint(mode != "stopped"), fmt.Sprint(mode == "changed-controller"))
+			if mode == "loopback" {
+				harness = strings.Replace(harness, "-Name 'replacement'", "-Name 'replacement' -LoopbackOnly", 1)
+			}
 			path := filepath.Join(dir, "test.ps1")
 			write(path, harness)
 			out, err := exec.Command(ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path).CombinedOutput()
@@ -110,6 +122,18 @@ if ($global:fixtureChanged -ne $%s) {throw 'wrong service update behavior'}
 			identity, err := os.ReadFile(filepath.Join(state, "identity.json"))
 			if err != nil || string(identity) != "existing identity fixture" {
 				t.Fatal("existing identity lost")
+			}
+			if mode == "loopback" || mode == "preserve-loopback" {
+				raw, err := os.ReadFile(filepath.Join(state, "forward-policy.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var policy struct {
+					LoopbackOnly bool `json:"loopbackOnly"`
+				}
+				if err := json.Unmarshal(raw, &policy); err != nil || !policy.LoopbackOnly {
+					t.Fatal("local policy was not installed or preserved", err)
+				}
 			}
 		})
 	}

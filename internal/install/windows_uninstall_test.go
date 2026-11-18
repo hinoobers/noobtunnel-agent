@@ -70,6 +70,7 @@ func TestWindowsUninstallDiscovery(t *testing.T) {
 			// Only the elevation block is bypassed. All actual destructive operations
 			// target the isolated fixture; native service/firewall calls are mocked.
 			source := string(WindowsScript())
+			source = strings.ReplaceAll(source, "'Machine'", "'Process'")
 			start := strings.Index(source, "$identity = [Security.Principal.WindowsIdentity]")
 			end := strings.Index(source[start:], "[void](Get-RemainingSetupSeconds)") + start
 			source = source[:start] + source[end:]

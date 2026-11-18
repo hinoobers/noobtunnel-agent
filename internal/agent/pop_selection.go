@@ -25,6 +25,8 @@ const (
 type controlMeasurement struct {
 	best, worst time.Duration
 	err         error
+	popID       string
+	samples     []float64
 }
 
 // Every round compares the alternative's worst RTT with the incumbent's best.
@@ -94,9 +96,16 @@ func (a *Agent) closeNextControl() {
 	}
 }
 
-func (a *Agent) acceptControlMove(move controlMove) {
+func (a *Agent) acceptControlMove(move controlMove) bool {
 	host, _, _ := net.SplitHostPort(move.target)
 	a.mu.Lock()
+	if !a.fasterPOPTransferAllowedLocked() {
+		a.mu.Unlock()
+		if move.conn != nil {
+			_ = move.conn.Close()
+		}
+		return false
+	}
 	a.preferredControl, a.lastControlMove = host, time.Now()
 	a.nextControlConn = move.conn
 	a.nextControlFrom = move.from
@@ -105,6 +114,11 @@ func (a *Agent) acceptControlMove(move controlMove) {
 	a.log.Info("moving to consistently faster POP", "controller", move.target,
 		"currentRTT", move.currentRTT.Round(time.Millisecond), "candidateRTT", move.candidateRTT.Round(time.Millisecond),
 		"consecutiveChecks", controlBetterRounds, "cooldown", controlMoveCooldown)
+	return true
+}
+
+func (a *Agent) fasterPOPTransferAllowedLocked() bool {
+	return a.session == nil || a.session.welcome.AllowFasterPOPTransfer == nil || *a.session.welcome.AllowFasterPOPTransfer
 }
 
 func (a *Agent) restoreControlAfterMove(from string) {
@@ -144,7 +158,7 @@ func (a *Agent) watchControlPOPs(ctx context.Context, current string, moves chan
 	}
 	connectedAt := time.Now()
 	policy := controlSelection{}
-	timer := time.NewTimer(controlProbeInterval + time.Duration(rand.Int64N(int64(5*time.Second))))
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
 		select {
@@ -156,11 +170,6 @@ func (a *Agent) watchControlPOPs(ctx context.Context, current string, moves chan
 		addresses := append([]string(nil), a.controlAddresses...)
 		lastMove := a.lastControlMove
 		a.mu.Unlock()
-		if !lastMove.IsZero() && time.Since(lastMove) < controlMoveCooldown {
-			policy = controlSelection{}
-			timer.Reset(controlProbeInterval)
-			continue
-		}
 		targets := []string{current}
 		for _, ip := range publicControls(addresses) {
 			target := net.JoinHostPort(ip, port)
@@ -173,6 +182,20 @@ func (a *Agent) watchControlPOPs(ctx context.Context, current string, moves chan
 			continue
 		}
 		measurements := a.measureControlPOPs(ctx, targets, host)
+		a.mu.Lock()
+		allowTransfer := a.fasterPOPTransferAllowedLocked()
+		a.mu.Unlock()
+		if !allowTransfer {
+			policy = controlSelection{}
+			timer.Reset(controlProbeInterval)
+			continue
+		}
+		// Keep measurements fresh during the migration cooldown.
+		if !lastMove.IsZero() && time.Since(lastMove) < controlMoveCooldown {
+			policy = controlSelection{}
+			timer.Reset(controlProbeInterval)
+			continue
+		}
 		candidate := policy.observe(current, measurements)
 		if candidate != "" && controlMoveAllowed(time.Now(), connectedAt, lastMove) {
 			// Warm the actual pinned control upgrade before closing the incumbent.
@@ -211,7 +234,37 @@ func (a *Agent) measureControlPOPs(ctx context.Context, targets []string, host s
 		})
 	}
 	wg.Wait()
+	if ctx.Err() == nil {
+		a.rememberControlMeasurements(results)
+		a.mu.Lock()
+		a.controlLatencySamples = map[string][]float64{}
+		for _, m := range results {
+			if m.err == nil && m.popID != "" && len(m.samples) == 3 {
+				a.controlLatencySamples[m.popID] = append([]float64(nil), m.samples...)
+			}
+		}
+		a.controlLatencyAt = time.Now()
+		a.mu.Unlock()
+	}
 	return results
+}
+
+func (a *Agent) rememberControlMeasurements(results map[string]controlMeasurement) {
+	now := time.Now()
+	a.mu.Lock()
+	if a.controlMeasurements == nil {
+		a.controlMeasurements = make(map[string]cachedControlMeasurement)
+	}
+	for target, m := range results {
+		a.controlMeasurements[target] = cachedControlMeasurement{RTT: m.worst, At: now, Failed: m.err != nil || m.worst <= 0}
+	}
+	for target, m := range a.controlMeasurements {
+		if !m.fresh(now) {
+			delete(a.controlMeasurements, target)
+		}
+	}
+	a.mu.Unlock()
+	a.saveControls()
 }
 
 func (a *Agent) measureControlPOP(ctx context.Context, target, host string) (m controlMeasurement) {
@@ -251,6 +304,13 @@ func (a *Agent) measureControlPOP(ctx context.Context, target, host string) (m c
 			m.err = errors.New("agent: POP did not answer its local latency probe")
 			return
 		}
+		id := response.Header.Get("X-Noobtunnel-POP")
+		if m.popID != "" && m.popID != id {
+			m.err = errors.New("agent: POP identity changed during measurement")
+			return
+		}
+		m.popID = id
+		m.samples = append(m.samples, float64(elapsed)/float64(time.Millisecond))
 		if m.best == 0 || elapsed < m.best {
 			m.best = elapsed
 		}

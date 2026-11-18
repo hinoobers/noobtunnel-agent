@@ -1,14 +1,19 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
+		if err := runInfo(nil); err != nil {
+			fmt.Fprintln(os.Stderr, "noobtunnel:", err)
+			os.Exit(1)
+		}
+		return
 	}
 	args := os.Args[2:]
 	var err error
@@ -19,6 +24,10 @@ func main() {
 		err = runQuick(args)
 	case "status":
 		err = runStatus(args)
+	case "info":
+		err = runInfo(args)
+	case "loopback-only":
+		err = runLoopbackOnly(args)
 	case "doctor":
 		err = runDoctor(args)
 	case "keygen":
@@ -32,6 +41,9 @@ func main() {
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "noobtunnel:", err)
 		os.Exit(1)
@@ -44,6 +56,8 @@ func usage() {
   agent    Connect this machine to a control node
   quick    Find or install an agent and publish a resource
   status   Show local agent state
+  info     Show version, agent state and settings (also the default)
+  loopback-only [on|off|status]  Manage the local forwarding restriction
   doctor   Check local agent requirements
   keygen   Generate a WireGuard key pair
   install  Print an agent install command
