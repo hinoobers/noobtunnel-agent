@@ -1,0 +1,22 @@
+# NoobTunnel Source-Available License 1.0
+
+Copyright (c) 2026 NoobTunnel. All rights reserved.
+
+Permission is granted to any person to access, view, inspect, and audit the source code of the NoobTunnel Agent.
+
+You may compile, execute, and modify the software solely for the following purposes:
+
+1. Using the software with official NoobTunnel infrastructure.
+2. Conducting security research, debugging, and local development.
+3. Preparing and submitting contributions to the official NoobTunnel project.
+
+The following activities are prohibited without prior written permission from the copyright holder:
+
+1. Using the software to connect to or operate an unofficial tunneling service.
+2. Using the software as part of a competing tunneling platform.
+3. Redistributing, sublicensing, or selling the software or modified versions.
+4. Removing or misrepresenting copyright and attribution notices.
+
+Contributions submitted to the official project remain owned by their respective authors. By submitting a contribution, contributors grant the project owner a perpetual, worldwide, non-exclusive, royalty-free license to use, modify, distribute, sublicense, and commercially exploit their contributions.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW.
