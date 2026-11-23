@@ -302,11 +302,15 @@ while ((Get-RemainingSetupSeconds) -gt 0) {
         Write-Output "Agent connected. Mesh address: $($runtime.address)"
         exit 0
       }
-      if ($runtime.lastError) {
+      # Older agents publish requested reconnects as errors while retrying.
+      if ($runtime.lastError -and $runtime.lastError -notmatch '^agent: reconnect requested(?::|$)') {
         if ($runtime.lastError -ne $lastFailure) { Write-Warning "Agent setup: $($runtime.lastError)" }
         $lastFailure = $runtime.lastError
         $failureSeen++
         if ($failureSeen -ge 10) { throw "Agent could not connect: $lastFailure" }
+      } else {
+        $lastFailure = ''
+        $failureSeen = 0
       }
     }
   }

@@ -60,3 +60,44 @@ func TestWindowsQuickInstallerReturnsBeforeLocalReadinessWait(t *testing.T) {
 		t.Fatalf("Quick installer failed to return after service startup: %v\n%s", err, out)
 	}
 }
+
+func TestWindowsInstallerWaitsThroughRequestedReconnect(t *testing.T) {
+	if _, err := exec.LookPath("powershell.exe"); err != nil {
+		t.Skip("Windows PowerShell unavailable")
+	}
+	source := string(WindowsScript())
+	start := strings.Index(source, "Write-Output 'Waiting for agent to connect...'")
+	if start < 0 {
+		t.Fatal("missing readiness wait")
+	}
+	mocks := `
+$script:poll = 0
+function Get-RemainingSetupSeconds { if ($script:poll -lt 30) { 1 } else { 0 } }
+function Start-Sleep { param($Milliseconds); $script:poll++ }
+function Get-Service { param($Name); @{ Status = 'Running' } }
+function Test-Path { param($LiteralPath); $true }
+function Get-Content {
+    param($LiteralPath, [switch]$Raw)
+    if ($script:poll -le 12) {
+        '{"connected":false,"lastError":"agent: reconnect requested: generated a fresh device identity for this registration"}'
+    } else {
+        $nextStatus
+    }
+}
+`
+	for _, tc := range []struct {
+		name, status, message string
+		wantError             bool
+	}{
+		{"successful enrollment", `{"connected":true,"address":"10.77.1.2"}`, "Agent connected. Mesh address: 10.77.1.2", false},
+		{"persistent failure", `{"connected":false,"lastError":"agent: token rejected"}`, "Agent could not connect: agent: token rejected", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := "$nextStatus = '" + tc.status + "'\n" + mocks + source[start:]
+			out, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+			if (err != nil) != tc.wantError || !strings.Contains(string(out), tc.message) || strings.Contains(string(out), "generated a fresh device identity") {
+				t.Fatalf("unexpected installer result: %v\n%s", err, out)
+			}
+		})
+	}
+}

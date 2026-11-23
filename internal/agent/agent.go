@@ -333,7 +333,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		if err == nil {
 			return nil
 		}
-		a.setLastError(err.Error())
+		reconnectRequested := errors.Is(err, errReconnectRequest)
+		if reconnectRequested {
+			a.setLastError("")
+		} else {
+			a.setLastError(err.Error())
+		}
 		a.saveRuntime(ctx)
 		switch {
 		case errors.Is(err, errRevoked), errors.Is(err, errTokenRejected):
@@ -342,11 +347,15 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.log.Info("stopping on control node request")
 			return nil
 		}
-		if time.Since(start) > 10*time.Second || errors.Is(err, errReconnectRequest) {
+		if time.Since(start) > 10*time.Second || reconnectRequested {
 			backoff = minBackoff
 		}
 		delay := reconnectDelay(backoff)
-		a.log.Warn("control connection ended, retrying", "error", err, "in", delay.Round(time.Millisecond))
+		if reconnectRequested {
+			a.log.Info("reconnecting to control node", "reason", err, "in", delay.Round(time.Millisecond))
+		} else {
+			a.log.Warn("control connection ended, retrying", "error", err, "in", delay.Round(time.Millisecond))
+		}
 		select {
 		case <-ctx.Done():
 			return nil
